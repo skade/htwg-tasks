@@ -23,13 +23,23 @@ impl From<std::io::Error> for ServerError {
     }
 }
 
+trait ResultExt<T, E> {
+    fn pass<X, Y>(self) -> Result<X, Y> where T: Into<X>, E: Into<Y>;
+}
+
+impl<T,E> ResultExt<T, E> for Result<T, E> {
+    fn pass<X, Y>(self) -> Result<X, Y> where T: Into<X>, E: Into<Y> {
+        self.map(T::into).map_err(E::into)
+    }
+}
+
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:7878").unwrap();
 
     let mut storage = VecDeque::new();
 
     for stream in listener.incoming() {
-        let res = stream.map_err(|e| e.into() )
+        let res = stream.pass()
                   .and_then(|mut s| {
                       handle(&mut s, &mut storage)
                   });
@@ -50,8 +60,8 @@ fn handle(stream: &mut TcpStream, storage: &mut VecDeque<String>) -> Result<(), 
         redisish::Command::Retrieve => {
             let data = storage.pop_front();
             match data {
-                Some(message) => write!(stream, "{}", message).map_err( |e| e.into() ),
-                None => write!(stream, "No message in inbox!\n").map_err( |e| e.into() )
+                Some(message) => write!(stream, "{}", message).pass(),
+                None => write!(stream, "No message in inbox!\n").pass()
             }
         }
     }
@@ -61,5 +71,5 @@ fn read_command(stream: &mut TcpStream) -> Result<redisish::Command, ServerError
     let mut read_buffer = String::new();
     let mut buffered_stream = BufReader::new(stream);
     buffered_stream.read_line(&mut read_buffer)?;
-    redisish::parse(&read_buffer).map_err( |e| e.into() )
+    redisish::parse(&read_buffer).pass()
 }
