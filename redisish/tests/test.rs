@@ -24,6 +24,13 @@ fn test_empty_string() {
 }
 
 #[test]
+fn test_empty_message() {
+    let line = "\n";
+    let result = redisish::parse(line);
+    assert_eq!(result, Err(Error::EmptyMessage));
+}
+
+#[test]
 fn test_missing_newline() {
     let line = "FooBar";
     let result = redisish::parse(line);
