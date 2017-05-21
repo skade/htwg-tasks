@@ -5,3 +5,9 @@ authors = ["Florian Gilcher <florian.gilcher@asquera.de>"]
 
 [dependencies]
 redisish = { path = "../redisish" }
+futures = "0.1"
+tokio-core = "0.1"
+tokio-service = "0.1"
+tokio-proto = "0.1"
+tokio-io = "0.1"
+bytes = "0.4"

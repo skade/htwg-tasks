@@ -1,10 +1,38 @@
+extern crate futures;
+extern crate tokio_core;
+extern crate tokio_proto;
+extern crate tokio_service;
+extern crate tokio_io;
 extern crate redisish;
+extern crate bytes;
 
-use std::net::{TcpListener,TcpStream};
-use std::io::prelude::*;
-use std::io::BufReader;
 use std::collections::VecDeque;
 use std::sync::{Mutex,Arc};
+
+use std::io;
+use std::str;
+
+use tokio_io::codec::{Encoder, Decoder};
+use tokio_io::{AsyncRead, AsyncWrite};
+use tokio_io::codec::Framed;
+use bytes::BytesMut;
+use tokio_proto::TcpServer;
+use tokio_proto::pipeline::ServerProto;
+use tokio_service::Service;
+
+use futures::{future, Future, BoxFuture};
+
+pub struct RedisishCodec;
+pub struct RedisishProto;
+pub struct MailboxService<T> {
+    mailbox: Arc<SyncedMailbox<T>>
+}
+
+pub enum ServerResponse {
+    Empty,
+    Stored,
+    Value(String)
+}
 
 struct SyncedMailbox<T> {
     inner: Mutex<VecDeque<T>>
@@ -36,7 +64,7 @@ impl<T> Storage<T> for SyncedMailbox<T> {
 }
 
 #[derive(Debug)]
-enum ServerError {
+pub enum ServerError {
     ParseError(redisish::Error),
     IoError(std::io::Error),
     LockError
@@ -60,46 +88,111 @@ impl<T> From<std::sync::PoisonError<T>> for ServerError {
     }
 }
 
-fn main() {
-    let listener = TcpListener::bind("127.0.0.1:7878").unwrap();
+impl Decoder for RedisishCodec {
+    type Item = redisish::Command;
+    type Error = io::Error;
 
-    let storage = Arc::new(SyncedMailbox::new());
+    fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Self::Item>> {
+        if let Some(i) = buf.iter().position(|&b| b == b'\n') {
+            // remove the serialized frame from the buffer.
+            let line = buf.split_to(i + 1);
 
-    for stream in listener.incoming() {
-        let storage_handle = storage.clone();
+            // Turn this data into a UTF string and return it in a Frame.
+            let input = match str::from_utf8(&line) {
+                Ok(s) => s,
+                Err(_) => return Err(io::Error::new(io::ErrorKind::Other,
+                                             "invalid UTF-8")),
+            };
 
-        std::thread::spawn(move || {
-            let res = stream.map_err(|e| e.into() )
-                    .and_then(|mut s| {
-                        handle(&mut s, storage_handle.as_ref())
-                    });
-        
-            if let Err(e) = res {
-                println!("Error occured: {:?}", e);
+            redisish::parse(&input).map(|v| v.into() )
+                .map_err(|_| io::Error::new(io::ErrorKind::Other,
+                                             "message parsing failed") )
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl Encoder for RedisishCodec {
+    type Item = ServerResponse;
+    type Error = io::Error;
+
+    fn encode(&mut self, msg: ServerResponse, buf: &mut BytesMut)
+             -> io::Result<()>
+    {
+        let msg = match msg {
+            ServerResponse::Empty => "No message stored",
+            ServerResponse::Value(ref v) => v.as_ref(),
+            ServerResponse::Stored => "Stored message"
+        };
+
+        buf.extend(msg.as_bytes());
+        buf.extend(b"\n");
+        Ok(())
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + 'static> ServerProto<T> for RedisishProto {
+    /// For this protocol style, `Request` matches the `Item` type of the codec's `Encoder`
+    type Request = redisish::Command;
+
+    /// For this protocol style, `Response` matches the `Item` type of the codec's `Decoder`
+    type Response = ServerResponse;
+
+    /// A bit of boilerplate to hook in the codec:
+    type Transport = Framed<T, RedisishCodec>;
+    type BindTransport = Result<Self::Transport, io::Error>;
+    fn bind_transport(&self, io: T) -> Self::BindTransport {
+        Ok(io.framed(RedisishCodec))
+    }
+}
+
+impl Service for MailboxService<String> {
+    // These types must match the corresponding protocol types:
+    type Request = redisish::Command;
+    type Response = ServerResponse;
+
+    // For non-streaming protocols, service errors are always io::Error
+    type Error = io::Error;
+
+    // The future for computing the response; box it for simplicity.
+    type Future = BoxFuture<Self::Response, Self::Error>;
+
+    // Produce a future for computing a response from a request.
+    fn call(&self, command: Self::Request) -> Self::Future {
+        let result = match command {
+            redisish::Command::Publish(message) => {
+                self.mailbox.add_message(message).map(|_| ServerResponse::Stored )
             }
+            redisish::Command::Retrieve => {
+                self.mailbox.retrieve_message().map(|data| {
+                    match data {
+                        Some(message) => ServerResponse::Value(message),
+                        None => ServerResponse::Empty
+                    }
+                })
+            }
+        }.map_err( |_| {
+            io::Error::new(io::ErrorKind::Other,
+                                             "Internal Server Error")
         });
+
+        future::result(result).boxed()
     }
 }
 
-fn handle<S: Storage<String>>(stream: &mut TcpStream, storage: &S) -> Result<(), ServerError> {
-    let command = read_command(stream)?;
-    match command {
-        redisish::Command::Publish(message) => {
-            storage.add_message(message).map_err(|e| e.into())
-        }
-        redisish::Command::Retrieve => {
-            let data = storage.retrieve_message()?;
-            match data {
-                Some(message) => write!(stream, "{}", message).map_err( |e| e.into() ),
-                None => write!(stream, "No message in inbox!\n").map_err( |e| e.into() )
-            }
-        }
-    }
-}
 
-fn read_command(stream: &mut TcpStream) -> Result<redisish::Command, ServerError> {
-    let mut read_buffer = String::new();
-    let mut buffered_stream = BufReader::new(stream);
-    buffered_stream.read_line(&mut read_buffer)?;
-    redisish::parse(&read_buffer).map_err( |e| e.into() )
+fn main() {
+    // Specify the localhost address
+    let addr = "127.0.0.1:7878".parse().unwrap();
+
+    // The builder requires a protocol and an address
+    let server = TcpServer::new(RedisishProto, addr);
+
+    let mailbox = Arc::new(SyncedMailbox::new());
+
+    // We provide a way to *instantiate* the service for each new
+    // connection; here, we just immediately return a new instance.
+    server.serve(move || Ok(MailboxService { mailbox: mailbox.clone() }));
+
 }
