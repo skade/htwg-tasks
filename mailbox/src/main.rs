@@ -20,7 +20,8 @@ use tokio_proto::TcpServer;
 use tokio_proto::pipeline::ServerProto;
 use tokio_service::Service;
 
-use futures::{future, Future, BoxFuture};
+use futures::future;
+use futures::future::FutureResult;
 
 pub struct RedisishCodec;
 pub struct RedisishProto;
@@ -156,7 +157,7 @@ impl Service for MailboxService<String> {
     type Error = io::Error;
 
     // The future for computing the response; box it for simplicity.
-    type Future = BoxFuture<Self::Response, Self::Error>;
+    type Future = FutureResult<Self::Response, Self::Error>;
 
     // Produce a future for computing a response from a request.
     fn call(&self, command: Self::Request) -> Self::Future {
@@ -177,7 +178,7 @@ impl Service for MailboxService<String> {
                                              "Internal Server Error")
         });
 
-        future::result(result).boxed()
+        future::result(result)
     }
 }
 
